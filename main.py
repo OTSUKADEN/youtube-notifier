@@ -1,14 +1,44 @@
 import os
 import re
-from collections import Counter
+import urllib.parse
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 import requests
 
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
-SEARCH_KEYWORDS = ["バカゲー 実況", "ホラゲー 実況", "ホラーゲーム 実況"]
-GAMING_CATEGORY_ID = "20"
+# 最新のバカゲー・ホラゲー・単発ヒット作を拾うための検索ワード
+SEARCH_KEYWORDS = [
+    "バカゲー 実況",
+    "ホラーゲーム 単発",
+    "Steam 新作 実況",
+    "異変探し 実況",
+    "短編ホラー 実況",
+]
+
+# タイトル抽出時に除外する無駄な単語リスト
+EXCLUDE_WORDS = [
+    "切り抜き",
+    "きりぬき",
+    "切抜",
+    "実況",
+    "単発",
+    "新作",
+    "閲覧注意",
+    "爆笑",
+    "神ゲー",
+    "バカゲー",
+    "ホラゲー",
+    "ホラーゲーム",
+    "前編",
+    "後編",
+    "完結",
+    "無料",
+    "Steam",
+    "ゲーム",
+    "まとめ",
+]
 
 
 def get_one_week_ago_iso():
@@ -23,7 +53,6 @@ def fetch_trending_videos(keyword, max_results=25):
         "part": "snippet",
         "q": keyword,
         "type": "video",
-        "videoCategoryId": GAMING_CATEGORY_ID,
         "order": "viewCount",
         "publishedAfter": get_one_week_ago_iso(),
         "maxResults": max_results,
@@ -37,9 +66,21 @@ def get_video_and_channel_details(video_items):
     if not video_items:
         return []
 
-    video_ids = [item["id"]["videoId"] for item in video_items]
+    filtered_items = []
+    for item in video_items:
+        title = item["snippet"]["title"]
+        if not any(
+            clip_word in title
+            for clip_word in ["切り抜き", "きりぬき", "切抜", "【切抜】"]
+        ):
+            filtered_items.append(item)
+
+    if not filtered_items:
+        return []
+
+    video_ids = [item["id"]["videoId"] for item in filtered_items]
     channel_ids = list(
-        set([item["snippet"]["channelId"] for item in video_items])
+        set([item["snippet"]["channelId"] for item in filtered_items])
     )
 
     v_url = "https://www.googleapis.com/youtube/v3/videos"
@@ -70,53 +111,61 @@ def get_video_and_channel_details(video_items):
         channel_id = v_item["snippet"]["channelId"]
         sub_count = channel_sub_map.get(channel_id, 0)
 
+        # 登録者数を超える動画だけを抽出
         if sub_count > 0 and view_count > sub_count:
+            # 再生数と登録者数の情報も合わせて渡す
+            v_item["sub_count"] = sub_count
+            v_item["view_count"] = view_count
+            v_item["ratio"] = round(view_count / sub_count, 1)
             viral_videos.append(v_item)
 
     return viral_videos
 
 
-def extract_game_titles(video_items):
-    titles = []
-    exclude_words = [
-        "実況",
-        "単発",
-        "新作",
-        "閲覧注意",
-        "爆笑",
-        "神ゲー",
-        "バカゲー",
-        "ホラゲー",
-        "前編",
-        "後編",
-        "完結",
-        "無料",
-    ]
+def extract_game_data(video_items):
+    game_stats = defaultdict(lambda: {"count": 0, "ratios": []})
 
     for item in video_items:
         title = item["snippet"]["title"]
         matches = re.findall(r"[『【](.*?)[』】]", title)
         for match in matches:
-            if not any(ex in match for ex in exclude_words) and len(match) > 1:
-                titles.append(match)
-    return titles
+            if not any(ex in match for ex in EXCLUDE_WORDS) and len(match) > 1:
+                game_stats[match]["count"] += 1
+                game_stats[match]["ratios"].append(item["ratio"])
+
+    # 検出件数の多い上位5個のゲームを抽出
+    sorted_games = sorted(
+        game_stats.items(), key=lambda x: x[1]["count"], reverse=True
+    )[:5]
+    return sorted_games
 
 
 def send_discord_notification(trending_games):
     if not trending_games:
-        content = "🎮 **YouTube 穴場・バズゲーム通知**\n直近で「チャンネル登録者数を超える再生数」を出している注目ゲームは見つかりませんでした。"
+        content = "🎮 **YouTube 注目ゲーム通知**\n直近で「登録者数を超える再生数」を記録した注目のゲームタイトルは見つかりませんでした。"
     else:
-        game_list_str = "\n".join(
-            [
-                f"・**{game}** (バズ判定件数: {count}件)"
-                for game, count in trending_games
-            ]
-        )
+        game_list_items = []
+        for game, data in trending_games:
+            count = data["count"]
+            avg_ratio = round(sum(data["ratios"]) / len(data["ratios"]), 1)
+
+            encoded_game = urllib.parse.quote(game)
+            steam_url = f"https://store.steampowered.com/search/?term={encoded_game}"
+
+            item_str = (
+                f"・**{game}** (バズ判定: {count}件)\n"
+                f"  └ 📊 再生/登録者数: **平均 {avg_ratio}倍**\n"
+                f"  └ 🔗 [Steam/ストアで見る]({steam_url})"
+            )
+            game_list_items.append(item_str)
+
+        game_list_str = "\n\n".join(game_list_items)
+
         content = (
-            f"🔥 **【YouTube】登録者数超えのヒット・バズゲームタイトル**\n\n"
-            f"直近1週間で**「チャンネル登録者数よりも再生回数が多く回っている動画」**から自動抽出したおすすめタイトルです：\n\n"
+            f"🔥 **【YouTube】今バズっているゲームタイトル（登録者超え抽出）**\n\n"
+            f"直近1週間で**「チャンネル登録者数以上の再生数を出している動画（※切り抜き除外）」**から検出した最新・話題タイトルです：\n\n"
             f"{game_list_str}\n\n"
-            f"*※登録者数以上の再生数を記録している企画・ゲーム性の高いタイトルです。*"
+            f"*※倍率が高いほど、登録者数の枠を超えて検索やおすすめから再生されているヒット作です。*"
         )
 
     requests.post(DISCORD_WEBHOOK_URL, json={"content": content})
@@ -134,9 +183,7 @@ def main():
         viral_videos = get_video_and_channel_details(search_results)
         viral_video_pool.extend(viral_videos)
 
-    game_candidates = extract_game_titles(viral_video_pool)
-    top_games = Counter(game_candidates).most_common(5)
-
+    top_games = extract_game_data(viral_video_pool)
     send_discord_notification(top_games)
 
 
